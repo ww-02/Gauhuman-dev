@@ -1,0 +1,333 @@
+import os
+import random
+import shlex
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+from agents.base_agent import BaseAgent
+from agents.connector.pool import _ssh_pool
+from agents.launcher.collector import Collector
+from agents.manager.base_job import BaseJob
+from agents.manager.manager import Manager
+from utils.logging import TextLogger
+
+DEFAULT_COLLECTOR_URL = "http://0.0.0.0:5001/events"
+DEFAULT_COLLECTOR_TOKEN = "default-collector-token"
+_COLLECTOR_STARTED = False
+_COLLECTOR_LOCK = threading.Lock()
+
+
+class Launcher(BaseAgent):
+
+    def __init__(
+        self,
+        commands: List[str],
+        expected_files: Optional[List[str]] = None,
+        epochs: int = 100,
+        sleep_time: int = 180,
+        outdated_days: int | None = None,
+        outdated_date: datetime | None = None,
+        gpu_pool: List[Tuple[str, List[int]]] = [],
+        user_names: Dict[str, str] = {},
+        timeout: int = 5,
+        log_path: str = "",
+        project_dir: str = "",
+        conda_env: str = "",
+        git_branch: str = "main",
+        keep_tmux: Optional[bool] = False,
+        force_progress_recompute: bool = False,
+        collector_url: str = DEFAULT_COLLECTOR_URL,
+        collector_token: str = DEFAULT_COLLECTOR_TOKEN,
+    ) -> None:
+        r"""
+        Args:
+            commands (List[str]): canonical commands representing the experiments to manage.
+            expected_files (Optional[List[str]]): the expected files under a work dir to check for.
+            epochs (int): the number of epochs to run.
+            sleep_time (int): the time in seconds to wait to determine if a sessions is still running.
+            outdated_days (int | None): the number of days to wait to consider a run outdated.
+            outdated_date (datetime | None): absolute cutoff; artifacts older than this are outdated.
+            gpu_pool (List[Tuple[str, List[int]]]): list of (server, gpu_indices) tuples.
+            user_names (Dict[str, str]): the user names for the servers.
+            timeout (int): the timeout for the GPU monitor.
+            log_path (str): the path to the log file.
+            project_dir (str): the project directory.
+            conda_env (str): the conda environment to use.
+            keep_tmux (Optional[bool]): whether to keep the tmux session alive.
+            force_progress_recompute (bool): if True, bypass cache and recompute progress from scratch.
+            collector_url (str): HTTP endpoint for posting failure payloads.
+            collector_token (str): bearer token for collector authentication.
+        """
+        assert (
+            isinstance(commands, list) and commands
+        ), "commands must be a non-empty list"
+        normalized_commands = [command.strip() for command in commands]
+
+        super(Launcher, self).__init__(
+            commands=normalized_commands,
+            expected_files=expected_files or [],
+            epochs=epochs,
+            sleep_time=sleep_time,
+            outdated_days=outdated_days,
+            outdated_date=outdated_date,
+            gpu_pool=gpu_pool,
+            user_names=user_names,
+            timeout=timeout,
+            force_progress_recompute=force_progress_recompute,
+        )
+        self.project_dir = project_dir
+        self.conda_env = conda_env
+        self.git_branch = git_branch
+        self.keep_tmux = keep_tmux
+        self.logger = TextLogger(filepath=log_path)
+        self.ssh_pool = _ssh_pool
+        self.collector_url = collector_url.strip()
+        self.collector_token = collector_token.strip()
+        assert self.collector_url, "collector_url must be provided"
+        assert self.collector_token, "collector_token must be provided"
+        self._start_collector()
+
+    def _start_collector(self) -> None:
+        global _COLLECTOR_STARTED
+        with _COLLECTOR_LOCK:
+            if _COLLECTOR_STARTED:
+                return
+            collector = Collector(
+                collector_url=self.collector_url,
+                collector_token=self.collector_token,
+            )
+            collector.start()
+            _COLLECTOR_STARTED = True
+
+    # ====================================================================================================
+    # experiment management
+    # ====================================================================================================
+
+    def _remove_stuck(self, all_jobs: List[BaseJob]) -> None:
+        stuck_commands = {
+            run.command.strip() for run in all_jobs if run.status == 'stuck'
+        }
+        if not stuck_commands:
+            return
+
+        def process_gpu(gpu):
+            gpu_stuck_info = {}
+            if not gpu.connected:
+                return {}
+            for proc in gpu.processes:
+                if proc.user != gpu.server.split('@')[0]:
+                    continue
+                proc_cmd = proc.cmd.strip()
+                if proc_cmd in stuck_commands or any(
+                    proc_cmd.endswith(cmd) for cmd in stuck_commands
+                ):
+                    gpu_stuck_info[proc_cmd] = (gpu.server, proc.pid)
+            return gpu_stuck_info
+
+        with ThreadPoolExecutor() as executor:
+            results = list(executor.map(process_gpu, self.connected_gpus))
+
+        # Combine all GPU results into a single dictionary
+        stuck_cfgs_info = {}
+        for gpu_info in results:
+            stuck_cfgs_info.update(gpu_info)
+
+        self.logger.info(f"The following processes will be killed {stuck_cfgs_info}")
+        for server, pid in stuck_cfgs_info.values():
+            self.ssh_pool.execute(server, ['kill', '-9', str(pid)])
+
+    def _find_missing_jobs(self, all_jobs: List[BaseJob]) -> List[BaseJob]:
+        r"""
+        Returns:
+            result (List[BaseJob]): the BaseJob instances for missing experiment runs.
+        """
+        return [job for job in all_jobs if job.status in {'failed', 'outdated'}]
+
+    def _find_idle_gpus(self, num_jobs: int) -> List[Dict[str, Any]]:
+        r"""
+        Find idle GPUs that meet both GPU and CPU resource constraints.
+
+        Args:
+            num_jobs (int): the maximum number of jobs allowed on a single GPU.
+        Returns:
+            idle_gpus (List[Dict[str, Any]]): a list of dictionaries with the following fields
+            {
+                server (str): a string in <user_name>@<server_ip> format.
+                resource_id (int): GPU index
+            }
+        """
+        idle_gpus = []
+        tracked_commands = {cmd.strip() for cmd in self.commands}
+
+        # Build a map of server -> CPU status for quick lookup
+        cpu_status_by_server = {}
+        for cpu in self.connected_cpus:
+            cpu_status_by_server[cpu.server] = cpu
+
+        # Find idle GPUs with CPU constraints
+        for gpu in self.connected_gpus:
+            # Check GPU constraints
+            util_avg = None
+            if gpu.util_stats and gpu.util_stats.get('avg') is not None:
+                util_avg = gpu.util_stats['avg']
+            mem_avg = None
+            if gpu.memory_stats and gpu.memory_stats.get('avg') is not None:
+                mem_avg = gpu.memory_stats['avg']
+            max_mem = gpu.max_memory if gpu.max_memory is not None else 0
+
+            gpu_util_ok = util_avg is not None and util_avg < 50
+            gpu_mem_ok = (
+                mem_avg is not None and max_mem > 0 and (max_mem - mem_avg) > 12 * 1024
+            )
+            tracked_processes = [
+                process
+                for process in gpu.processes
+                if process.cmd.strip() in tracked_commands
+                or any(process.cmd.strip().endswith(cmd) for cmd in tracked_commands)
+            ]
+            gpu_jobs_ok = len(tracked_processes) < num_jobs
+
+            # Check CPU constraints for the same server
+            server = gpu.server
+            cpu_ok = False
+            if server in cpu_status_by_server:
+                cpu = cpu_status_by_server[server]
+                if (
+                    cpu.cpu_stats is not None
+                    and cpu.memory_stats is not None
+                    and cpu.max_memory is not None
+                    and cpu.cpu_cores is not None
+                    and cpu.load_stats is not None
+                ):
+                    assert 'avg' in cpu.cpu_stats
+                    assert 'avg' in cpu.memory_stats
+                    assert 'avg' in cpu.load_stats
+                    cpu_util_ok = cpu.cpu_stats['avg'] < 80
+                    cpu_mem_ok = (
+                        cpu.max_memory - cpu.memory_stats['avg']
+                    ) > 4 * 1024  # 4GB
+                    cpu_load_ok = (
+                        cpu.load_stats['avg'] < cpu.cpu_cores
+                    )  # Load should be less than number of cores
+                    cpu_ok = cpu_util_ok and cpu_mem_ok and cpu_load_ok
+
+            # GPU is only considered idle if both GPU and CPU resources are available
+            if gpu_util_ok and gpu_mem_ok and gpu_jobs_ok and cpu_ok:
+                idle_gpus.append(
+                    {
+                        'server': gpu.server,
+                        'resource_id': gpu.index,
+                    }
+                )
+
+        self.logger.warning(f"Disconnected GPUs: {self.disconnected_gpus}")
+        self.logger.warning(f"Disconnected CPUs: {self.disconnected_cpus}")
+
+        return idle_gpus
+
+    def _launch_missing(self, all_jobs: List[BaseJob], num_jobs: int) -> bool:
+        r"""
+        Returns:
+            done (bool): nothing more to launch.
+        """
+        missing_jobs: List[BaseJob] = self._find_missing_jobs(all_jobs)
+        if len(missing_jobs) == 0:
+            return True
+        idle_gpus: List[Dict[str, Any]] = self._find_idle_gpus(num_jobs)
+        if len(idle_gpus) == 0:
+            self.logger.info("Waiting for idle GPUs (with sufficient CPU resources)...")
+            return False
+        random.shuffle(missing_jobs)
+        random.shuffle(idle_gpus)
+        num_launch = min(len(idle_gpus), len(missing_jobs))
+        idle_gpus = idle_gpus[:num_launch]
+        missing_jobs = missing_jobs[:num_launch]
+
+        def launch_job(resource, job: BaseJob):
+            # --- Validate job metadata
+            command = job.command.strip()
+            work_dir = os.path.normpath(job.work_dir)
+            assert work_dir, f"Job {command} does not provide a valid work_dir"
+
+            # --- Build remote command runner invocation
+            remote_runner_parts = [
+                "MKL_SERVICE_FORCE_INTEL=1",
+                f"CUDA_VISIBLE_DEVICES={resource['resource_id']}",
+                "python",
+                os.path.join("agents", "launcher", "remote_command.py"),
+                "--command",
+                command,
+                "--collector-url",
+                self.collector_url,
+                "--collector-token",
+                self.collector_token,
+                "--work-dir",
+                work_dir,
+            ]
+            remote_runner = shlex.join(remote_runner_parts)
+
+            # --- Build tmux payload
+            setup_steps = [
+                f"cd {self.project_dir}",
+                "git fetch",
+                f"git checkout {self.git_branch}",
+                "git pull || true",
+                "source ~/.bashrc",
+                f"source ~/miniconda3/bin/activate {self.conda_env}",
+                remote_runner,
+            ]
+            payload = " && ".join(setup_steps)
+            if self.keep_tmux:
+                payload = payload + "; exec bash"
+
+            # --- Launch tmux session
+            resource_label = f"GPU-{resource['resource_id']}"
+            session_name = f"{job.tmux_session_name()}-{resource_label}"
+            tmux_cmd = f"tmux new-session -d -s {session_name} \"{payload}\""
+
+            self.logger.info(
+                f"Executing command on {resource['server']} ({resource_label}): {tmux_cmd}"
+            )
+            self.ssh_pool.execute(
+                resource['server'],
+                ["bash", "-lc", tmux_cmd],
+            )
+
+        for gpu, job in zip(idle_gpus, missing_jobs, strict=True):
+            launch_job(gpu, job)
+            time.sleep(3)
+        return False
+
+    def spawn(self, num_jobs: int = 1) -> None:
+        while True:
+            self.logger.info('=' * 50)
+
+            self.logger.info("Collecting all running jobs...")
+            manager = Manager(
+                commands=self.commands,
+                epochs=self.epochs,
+                system_monitors=self.system_monitors,
+                sleep_time=self.sleep_time,
+                outdated_days=self.outdated_days,
+                outdated_date=self.outdated_date,
+                force_progress_recompute=self.force_progress_recompute,
+            )
+            all_jobs = list(manager.build_jobs().values())
+
+            avg_progress = manager.compute_average_progress()
+            self.logger.info(f"Average progress across commands: {avg_progress:.2f}%")
+
+            self.logger.info("Removing stuck jobs...")
+            self._remove_stuck(all_jobs)
+
+            self.logger.info("Launching missing jobs...")
+            done = self._launch_missing(all_jobs, num_jobs=num_jobs)
+
+            if done:
+                self.logger.info("All done.")
+
+            self.logger.info(f"Sleeping for {self.sleep_time} seconds...")
+            time.sleep(self.sleep_time)

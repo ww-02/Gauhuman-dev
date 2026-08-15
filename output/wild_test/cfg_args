@@ -1,0 +1,1 @@
+Namespace(sh_degree=3, source_path='/hy-tmp/GauHuman/data/wild_test', model_path='./output/wild_test', images='images', resolution=-1, white_background=False, data_device='cuda', eval=True, exp_name='wild_test', smpl_type='smplx', actor_gender='neutral', motion_offset_flag=False)

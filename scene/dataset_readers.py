@@ -414,7 +414,7 @@ def readCamerasMonoCapdata(path, output_view, white_background, image_scaling=1.
                 msk = cv2.resize(msk, (W, H), interpolation=cv2.INTER_NEAREST)
                 K[:2] = K[:2] * ratio
 
-            image = Image.fromarray(np.array(image*255.0, dtype=np.byte), "RGB")
+            image = Image.fromarray((np.clip(image, 0.0, 1.0) * 255.0).astype(np.uint8), "RGB")
 
             focalX = K[0,0]
             focalY = K[1,1]
@@ -651,7 +651,7 @@ def readCamerasZJUMoCapRefine(path, output_view, white_background, image_scaling
                 msk = cv2.resize(msk, (W, H), interpolation=cv2.INTER_NEAREST)
                 K[:2] = K[:2] * ratio
 
-            image = Image.fromarray(np.array(image*255.0, dtype=np.byte), "RGB")
+            image = Image.fromarray((np.clip(image, 0.0, 1.0) * 255.0).astype(np.uint8), "RGB")
 
             focalX = K[0,0]
             focalY = K[1,1]
@@ -864,7 +864,7 @@ def readCamerasDNARendering(path, output_view, white_background, image_scaling=0
                 msk = cv2.resize(msk, (W, H), interpolation=cv2.INTER_NEAREST)
                 K[:2] = K[:2] * ratio
 
-            image = Image.fromarray(np.array(image*255.0, dtype=np.byte), "RGB")
+            image = Image.fromarray((np.clip(image, 0.0, 1.0) * 255.0).astype(np.uint8), "RGB")
 
             focalX = K[0,0]
             focalY = K[1,1]

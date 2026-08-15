@@ -1,0 +1,116 @@
+import queue
+import threading
+from abc import ABC, abstractmethod
+from typing import Any, Dict, List, Optional
+
+import torch
+
+from utils.ops.apply import apply_tensor_op
+
+
+class BaseMetric(ABC):
+    """
+    Base class for all metrics.
+    """
+
+    def __init__(self, use_buffer: bool = True) -> None:
+        """Initialize the base metric."""
+        self.use_buffer = use_buffer
+        if self.use_buffer:
+            self._buffer_lock = threading.Lock()
+            self._buffer_queue = queue.Queue()
+            self._buffer_thread = threading.Thread(target=self._buffer_worker, daemon=True)
+            self._buffer_thread.start()
+        self.reset_buffer()
+
+    def reset_buffer(self) -> None:
+        """Reset the buffer."""
+        if self.use_buffer:
+            assert self._buffer_queue.empty(), "Buffer queue is not empty when resetting buffer"
+            with self._buffer_lock:
+                self.buffer = {}  # Now a dict mapping indices to data
+        else:
+            assert not hasattr(self, 'buffer')
+
+    def _buffer_worker(self) -> None:
+        """Background thread to handle buffer updates."""
+        while True:
+            item = self._buffer_queue.get()
+            data, idx = item['data'], item['idx']
+            processed_data = apply_tensor_op(func=lambda x: x.detach().cpu(), inputs=data)
+
+            with self._buffer_lock:
+                # Store data by index for order preservation
+                self.buffer[idx] = processed_data
+
+            self._buffer_queue.task_done()
+
+    def add_to_buffer(self, data: Dict[str, Any], datapoint: Dict[str, Dict[str, Any]]) -> None:
+        """
+        Add data to the buffer.
+
+        Args:
+            data: Dictionary of data to add to the buffer
+            datapoint: Complete datapoint to extract idx from
+        """
+        if self.use_buffer:
+            assert hasattr(self, 'buffer')
+            assert isinstance(self.buffer, dict)
+
+            # Extract idx from datapoint meta_info
+            assert 'meta_info' in datapoint and 'idx' in datapoint['meta_info']
+            idx_raw = datapoint['meta_info']['idx']
+
+            # Handle different idx formats (similar to BaseEvaluator)
+            if isinstance(idx_raw, torch.Tensor):
+                # Handle tensor format from DataLoader collation
+                assert idx_raw.shape == (1,), f"Expected single element tensor, got {idx_raw}"
+                assert idx_raw.dtype == torch.int64
+                idx = idx_raw.item()
+            elif isinstance(idx_raw, list):
+                # Handle list format
+                assert len(idx_raw) == 1
+                assert isinstance(idx_raw[0], int)
+                idx = idx_raw[0]
+            elif isinstance(idx_raw, int):
+                # Handle direct int format
+                idx = idx_raw
+            else:
+                raise ValueError(f"Unsupported idx format: {type(idx_raw)} with value {idx_raw}")
+
+            self._buffer_queue.put({'data': data, 'idx': idx})
+        else:
+            assert not hasattr(self, 'buffer')
+
+    def get_buffer(self) -> List[Any]:
+        """Thread-safe method to get a copy of the buffer as an ordered list."""
+        if self.use_buffer:
+            with self._buffer_lock:
+                # Convert dict to list, sorted by indices for order preservation
+                if not self.buffer:
+                    return []
+                sorted_indices = sorted(self.buffer.keys())
+                assert sorted_indices[0] == 0 and sorted_indices[-1] == len(self.buffer) - 1, f"{sorted_indices=}"
+                return [self.buffer[idx] for idx in sorted_indices]
+        raise RuntimeError("Buffer is not enabled")
+
+    @abstractmethod
+    def __call__(self, datapoint: Dict[str, Dict[str, Any]]) -> Any:
+        """
+        Compute metrics on a datapoint.
+
+        Args:
+            datapoint: Complete datapoint dictionary containing:
+                - 'inputs': Model inputs
+                - 'labels': Ground truth labels
+                - 'outputs': Model outputs (added by runner)
+                - 'meta_info': Metadata including 'idx'
+
+        Returns:
+            Dictionary of computed metrics
+        """
+        raise NotImplementedError("Abstract method BaseMetric.__call__ not implemented.")
+
+    @abstractmethod
+    def summarize(self, output_path: Optional[str] = None) -> Any:
+        raise NotImplementedError("Abstract method BaseMetric.summarize not implemented.")

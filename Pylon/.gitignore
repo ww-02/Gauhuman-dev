@@ -1,0 +1,33 @@
+__pycache__
+.vscode
+.claude
+logs
+outputs
+data/datasets/soft_links
+data/storages/aws_s3/config.local.json
+agents/snapshots
+agents/summaries
+
+# Python packaging
+*.egg-info/
+*.egg
+dist/
+build/
+
+# TypeScript / Node app artifacts (bundler- and framework-agnostic)
+node_modules/
+*.tsbuildinfo
+
+# Data
+*.ply
+
+# C++ compiled binaries and build artifacts
+*.o
+*.so
+*.cu.o
+*.cuda.o
+*.cpython-*.so
+build/
+*.ninja_deps
+*.ninja_log
+build.ninja

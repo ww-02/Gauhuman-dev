@@ -1,0 +1,1 @@
+Namespace(sh_degree=3, source_path='/hy-tmp/GauHuman/data/WildAvatar/__-ChmS-8m8', model_path='./output/', images='images', resolution=-1, white_background=False, data_device='cuda', eval=False, exp_name='', smpl_type='smplx', actor_gender='neutral', motion_offset_flag=False)

@@ -1,0 +1,98 @@
+"""Render camera geometry into image space using Bresenham lines."""
+
+from typing import Optional, Tuple, Union
+
+import torch
+
+from data.structures.three_d.camera.camera import Camera
+from data.structures.three_d.camera.camera_vis import camera_vis
+from models.three_d.point_cloud.ops.world_to_camera_transform import (
+    world_to_camera_transform,
+)
+
+
+def render_camera(
+    camera: Camera,
+    render_at_camera: Camera,
+    render_at_resolution: Tuple[int, int],
+    return_mask: bool = False,
+    frustum_size: float = 8.0,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    assert isinstance(camera, Camera), f"{type(camera)=}"
+    assert isinstance(render_at_camera, Camera), f"{type(render_at_camera)=}"
+    height, width = render_at_resolution
+    assert height > 0
+    assert width > 0
+
+    device = render_at_camera.device
+    dtype = render_at_camera.extrinsics.extrinsics.dtype
+
+    geometry = camera_vis(
+        camera=camera.to(device=device),
+        frustum_size=frustum_size,
+    )
+
+    render_at_camera = render_at_camera.to(device=device, convention='opencv')
+    render_intrinsics = render_at_camera.intrinsics
+    render_extrinsics = render_at_camera.extrinsics
+
+    overlay = torch.zeros(3, height, width, device=device, dtype=dtype)
+    mask = torch.zeros(height, width, device=device, dtype=dtype)
+
+    def project(points: torch.Tensor) -> Optional[torch.Tensor]:
+        points_cam = world_to_camera_transform(
+            points=points.to(device=device, dtype=dtype),
+            extrinsics=render_extrinsics.extrinsics,
+            inplace=False,
+        )
+        if not torch.all(points_cam[:, 2] > 1.0e-4):
+            return None
+        pixels = render_intrinsics.project(points_cam)
+        in_bounds = (
+            (pixels[:, 0] >= 0)
+            & (pixels[:, 0] < width)
+            & (pixels[:, 1] >= 0)
+            & (pixels[:, 1] < height)
+        )
+        if not torch.all(in_bounds):
+            return None
+        return torch.round(pixels).long()
+
+    def draw_segment(
+        start: torch.Tensor, end: torch.Tensor, color: torch.Tensor
+    ) -> None:
+        pixels = project(torch.stack([start, end], dim=0))
+        if pixels is None or pixels.shape[0] < 2:
+            return
+        draw_color = color.to(device=device, dtype=dtype)
+        u0 = float(pixels[0, 0].item())
+        v0 = float(pixels[0, 1].item())
+        u1 = float(pixels[1, 0].item())
+        v1 = float(pixels[1, 1].item())
+        du = u1 - u0
+        dv = v1 - v0
+        steps = int(max(abs(du), abs(dv))) + 1
+        t = torch.linspace(0.0, 1.0, steps, device=device, dtype=dtype)
+        u = torch.round(u0 + t * du).long()
+        v = torch.round(v0 + t * dv).long()
+        valid = (u >= 0) & (u < width) & (v >= 0) & (v < height)
+        if not torch.any(valid):
+            return
+        u = u[valid]
+        v = v[valid]
+        overlay[:, v, u] = draw_color.view(3, 1).expand(-1, u.shape[0])
+        mask[v, u] = 1.0
+
+    segments = geometry['axes'] + geometry['frustum_lines']
+    for segment in segments:
+        draw_segment(segment['start'], segment['end'], segment['color'])
+
+    center_proj = project(geometry['center'].unsqueeze(0))
+    if center_proj is not None and center_proj.shape[0] > 0:
+        cu = int(center_proj[0, 0].item())
+        cv = int(center_proj[0, 1].item())
+        assert 0 <= cu < width and 0 <= cv < height
+        overlay[:, cv, cu] = geometry['center_color'].to(device=device, dtype=dtype)
+        mask[cv, cu] = 1.0
+
+    return (overlay, mask) if return_mask else overlay

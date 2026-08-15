@@ -1,0 +1,51 @@
+# Torch stack is installed separately via docs/env_setup/requirements-torch-macos.txt
+
+# --- Core (macOS-compatible subset)
+ninja==1.13.0
+
+# --- ML and vision
+scipy
+scikit-learn
+scikit-image
+scikit-build-core
+timm==0.6.7
+einops
+kornia
+fvcore
+pycocotools
+opencv-python
+open3d
+nibabel
+plyfile
+laspy
+
+# --- Experiment utilities
+pytest
+tqdm
+tensorboard
+tensorboardX
+wandb
+ftfy
+regex
+easydict
+xxhash
+
+# --- Data and IO
+rasterio
+imageio
+pandas
+psutil
+paramiko
+boto3
+google-cloud-firestore==2.26.0
+
+# --- Visualization and apps
+matplotlib
+plotly
+dash
+dash-extensions
+
+# --- Misc tools
+black
+jsbeautifier
+rich
