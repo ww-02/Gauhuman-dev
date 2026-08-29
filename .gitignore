@@ -12,3 +12,21 @@ lib/gauhuman/diff_rasterization/dist
 lib/gauhuman/assets
 lib/gauhuman/data
 lib/gauhuman/submodules/diff-gaussian-rasterization/third_party/glm/doc
+# 调试备份文件
+*_backup_*
+*.bak*
+*.backup
+_*.log
+_*/
+_*.py
+_*.sh
+
+# 运行输出
+output/
+WildAvatar/
+
+# 命令行碎片参数
+--iterations
+--start_checkpoint
+--test_iterations
+-s

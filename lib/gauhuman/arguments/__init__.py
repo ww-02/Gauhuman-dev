@@ -59,6 +59,8 @@ class ModelParams(ParamGroup):
         self.actor_gender = "neutral"
         self.cameras_extent = 1.0
         self.motion_offset_flag = True
+        self.psd_pe_L = 4      # PSD Fourier positional-encoding freqs (2^0..2^(L-1))
+        self.psd_n_layers = 2  # PSD per-joint MLP depth
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -86,6 +88,25 @@ class OptimizationParams(ParamGroup):
         self.rotation_lr = 0.001
         self.pose_refine_lr = 0.00005
         self.lbs_offset_lr = 0.00005
+        self.joint_psd_lr = 0.00005
+        self.lambda_aiap = 0.1
+        self.lambda_lpips = 0.01
+        self.lambda_ssim = 0.01  # SSIM loss weight (higher -> higher SSIM)
+        self.lpips_shallow = False  # direction1: shallow-weighted VGG (retPerLayer)  # VGG perceptual-loss weight (higher -> lower LPIPS)
+        self.disable_psd = False
+        self.lambda_rot = 0.0        # AniGaussian rotation-rigidity prior
+        self.delayed_activation = False  # split-with-scale delayed activation
+        self.use_dyn_skin = False
+        self.no_knn_soft = False  # --no_knn_soft -> k=1 hard nearest (disable k=4 soft blend)
+        self.lambda_psd_res = 1e-4
+        self.sil_edge_weight = 0.0
+        self.sil_grad_weight = 0.0
+        self.joint_region_weight = 0.0
+        self.hand_region_boost = 2.0
+        self.joint_heatmap_sigma = 12.0
+        self.sil_joint_start_iter = 200
+        self.joint_offset_reg = 1e-4
+        self.max_joint_offset = 0.05
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
         self.densification_interval = 100

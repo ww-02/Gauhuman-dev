@@ -11,10 +11,12 @@
 
 import os
 import torch
-from utils.loss_utils import l1_loss, l2_loss, ssim
+from utils.loss_utils import l1_loss, l2_loss, ssim, sil_edge_loss, sil_grad_loss
 from gaussian_renderer import render, network_gui
+from nets.joint_psd import pose_residual_loss, IMPORTANT_JOINTS_SMPL
 import sys
 from scene import Scene, GaussianModel
+from nets.dyn_skin import DynamicSkinWeights
 from utils.general_utils import safe_state
 import numpy as np
 import cv2
@@ -34,6 +36,66 @@ from datasets.wildavatar_dataset import WildAvatarDatasetBatch
 import time
 from utils.loader_utils import InfiniteSampler, collate_fn, data_to_device
 from test import test_single
+import torch.nn.functional as F
+
+HAND_JOINTS = {20, 21}
+
+
+def build_joint_heatmap(viewpoint_cam, gaussians, sigma, hand_boost, joint_indices, hand_joints):
+    """Project SMPL world joints to pixels and build a Gaussian heatmap over the image.
+
+    Returns (H, W) heatmap in [0, 1] on the Gaussian device, or None if joints are unavailable.
+    """
+    if sigma <= 0:
+        return None
+    H = viewpoint_cam.image_height
+    W = viewpoint_cam.image_width
+
+    J_reg = gaussians.SMPL_NEUTRAL['J_regressor']
+    n_joints = J_reg.shape[0]
+    if n_joints == 0:
+        return None
+    dev = J_reg.device
+
+    wv = viewpoint_cam.world_vertex
+    if wv is None:
+        return None
+    wv = torch.as_tensor(wv, dtype=torch.float32, device=dev)
+    if wv.dim() == 3:
+        wv = wv[0]
+    if wv.dim() != 2 or wv.shape[1] != 3:
+        return None
+
+    joints_world = torch.matmul(J_reg.to(torch.float32), wv)  # (J, 3)
+
+    R = torch.as_tensor(viewpoint_cam.R, dtype=torch.float32, device=dev)
+    T = torch.as_tensor(viewpoint_cam.T, dtype=torch.float32, device=dev).reshape(-1)
+    K = torch.as_tensor(viewpoint_cam.K, dtype=torch.float32, device=dev)
+    cam = torch.matmul(joints_world, R) + T          # (J, 3)
+    xy = torch.matmul(cam, K.t())                    # (J, 3)
+    z = xy[:, 2].clamp_min(1e-6)
+    px = xy[:, 0] / z
+    py = xy[:, 1] / z
+
+    yy = torch.arange(H, device=dev, dtype=torch.float32)
+    xx = torch.arange(W, device=dev, dtype=torch.float32)
+    gy, gx = torch.meshgrid(yy, xx, indexing='ij')   # (H, W)
+
+    heat = torch.zeros(H, W, device=dev)
+    var = 2.0 * sigma * sigma
+    for j in joint_indices:
+        if j >= n_joints:
+            continue
+        amp = hand_boost if j in hand_joints else 1.0
+        dx = gx - px[j]
+        dy = gy - py[j]
+        heat = heat + amp * torch.exp(-(dx * dx + dy * dy) / var)
+
+    mx = heat.max()
+    if mx <= 0:
+        return None
+    return heat / mx
+
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint, debug_from):
     first_iter = 0
@@ -44,9 +106,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     training_set_iterator = iter(torch.utils.data.DataLoader(dataset=train_dataset, sampler=train_dataloader, batch_size=1, collate_fn=collate_fn, num_workers=12))
     
     tb_writer = prepare_output_and_logger(dataset)
-    gaussians = GaussianModel(dataset.sh_degree, dataset.smpl_type, dataset.motion_offset_flag, dataset.actor_gender)
+    gaussians = GaussianModel(dataset.sh_degree, dataset.smpl_type, dataset.motion_offset_flag, dataset.actor_gender,
+                              getattr(dataset, 'psd_pe_L', 4), getattr(dataset, 'psd_n_layers', 2))
+    gaussians.use_knn_soft = not getattr(opt, "no_knn_soft", False)
     scene = Scene(dataset, gaussians)
+    if getattr(opt, "use_dyn_skin", False):
+        gaussians.dyn_skin_net = DynamicSkinWeights(num_joints=24, pos_pe_L=4, hidden_dim=128, n_layers=3).cuda()
+
     gaussians.training_setup(opt)
+    if getattr(opt, "use_dyn_skin", False):
+        gaussians.optimizer.add_param_group({
+            "params": list(gaussians.dyn_skin_net.parameters()),
+            "lr": 1e-3,
+            "name": "dyn_skin"
+        })
+        print("[dyn_skin] attached DynamicSkinWeights (single-frame, RnD-inspired).")
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -100,8 +174,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if iteration == debug_from:
             pipe.debug = True
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background)
+        render_pkg = render(viewpoint_cam, gaussians, pipe, background, disable_psd=opt.disable_psd)
         image, alpha, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["render_alpha"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        d_xyz, d_scale, d_rot, d_alpha = render_pkg["d_xyz"], render_pkg["d_scale"], render_pkg["d_rot"], render_pkg["d_alpha"]
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
@@ -110,6 +185,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         Ll1 = l1_loss(image.permute(1,2,0)[bound_mask[0]==1], gt_image.permute(1,2,0)[bound_mask[0]==1])
         mask_loss = l2_loss(alpha[bound_mask==1], bkgd_mask[bound_mask==1])
 
+        # hand / joint emphasis heatmap (2D projection of SMPL world joints)
+        joint_extra = None
+        if iteration >= opt.sil_joint_start_iter and opt.joint_region_weight > 0:
+            heatmap = build_joint_heatmap(viewpoint_cam, gaussians, opt.joint_heatmap_sigma,
+                                          opt.hand_region_boost, IMPORTANT_JOINTS_SMPL, HAND_JOINTS)
+            if heatmap is not None:
+                joint_extra = opt.joint_region_weight * heatmap  # (H, W)
+
         # crop the object region
         x, y, w, h = cv2.boundingRect(bound_mask[0].cpu().numpy().astype(np.uint8))
         img_pred = image[:, y:y + h, x:x + w].unsqueeze(0)
@@ -117,9 +200,67 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # ssim loss
         ssim_loss = ssim(img_pred, img_gt)
         # lipis loss
-        lpips_loss = loss_fn_vgg(img_pred, img_gt).reshape(-1)
+        if getattr(opt, "lpips_shallow", False):
+            _, _per_layer = loss_fn_vgg(img_pred, img_gt, retPerLayer=True)
+            # shallow emphasis: relu1..relu5 weights (downweight deep semantics)
+            _w = [2.0, 1.5, 1.0, 0.5, 0.3]
+            lpips_loss = sum(_w[i] * _per_layer[i].reshape(-1) for i in range(len(_per_layer)))
+        else:
+            lpips_loss = loss_fn_vgg(img_pred, img_gt).reshape(-1)
 
-        loss = Ll1 + 0.1 * mask_loss + 0.01 * (1.0 - ssim_loss) + 0.01 * lpips_loss
+        loss = Ll1 + 0.1 * mask_loss + opt.lambda_ssim * (1.0 - ssim_loss) + opt.lambda_lpips * lpips_loss
+
+        # contour sharpening: silhouette boundary band + gradient match
+        if iteration >= opt.sil_joint_start_iter:
+            if opt.sil_edge_weight > 0:
+                edge_w = (1.0 + joint_extra).unsqueeze(0) if joint_extra is not None else None
+                loss = loss + opt.sil_edge_weight * sil_edge_loss(alpha, bkgd_mask, weight=edge_w)
+            if opt.sil_grad_weight > 0:
+                loss = loss + opt.sil_grad_weight * sil_grad_loss(alpha, bkgd_mask)
+
+        # extra L1 emphasis on hand / joint regions inside the body bounds
+        if joint_extra is not None:
+            inside = bound_mask[0] == 1
+            pix_diff = (image - gt_image).abs()  # (C, H, W)
+            joint_l1 = (pix_diff.permute(1, 2, 0)[inside] * joint_extra[inside].unsqueeze(1)).mean()
+            loss = loss + joint_l1
+
+        if d_xyz is not None:
+            loss = loss + opt.lambda_psd_res * pose_residual_loss(d_xyz, d_scale, d_rot, d_alpha)
+            if opt.joint_offset_reg > 0:
+                off_norm = d_xyz.norm(dim=-1)
+                loss = loss + opt.joint_offset_reg * (F.relu(off_norm - opt.max_joint_offset) ** 2).mean()
+        # ------ AIAP loss (as-isometric-as-possible, per 3DGS-Avatar) ------
+        if opt.lambda_aiap > 0:
+            _xc = render_pkg["means3D_canon"]  # (N, 3)
+            _xo = render_pkg["means3D_obs"]    # (N, 3)
+            if _xc.dim() == 3:
+                _xc = _xc.squeeze(0)
+            if _xo.dim() == 3:
+                _xo = _xo.squeeze(0)
+            _N = _xc.shape[0]
+            _S = min(1024, _N)
+            _idx = torch.randperm(_N, device=_xc.device)[:_S]
+            _q_c = _xc[_idx]; _q_o = _xo[_idx]
+            # kNN in canonical space, k=6 to skip self (nearest = query itself)
+            _, _nn = gaussians.knn_soft(_xc[None].detach(), _q_c[None].detach())
+            _nn = _nn[0]  # (S, 4)
+            _dc = (_q_c.unsqueeze(1) - _xc[_nn]).norm(dim=-1)  # (S, 4)
+            _do = (_q_o.unsqueeze(1) - _xo[_nn]).norm(dim=-1)  # (S, 4)
+            aiap_loss = (_dc - _do).abs().mean()
+            loss = loss + opt.lambda_aiap * aiap_loss
+        # ------ Rotation rigidity prior (AniGaussian lambda_rot): local d_rot consistency ------
+        if opt.lambda_rot > 0 and d_rot is not None:
+            _dr = d_rot.squeeze(0) if d_rot.dim() == 3 else d_rot          # (N, 3)
+            _xyz = gaussians.get_xyz.detach()                              # (N, 3) canonical
+            _N = _dr.shape[0]
+            _S = min(1024, _N)
+            _idx = torch.randperm(_N, device=_dr.device)[:_S]
+            _q_dr = _dr[_idx]                                              # (S, 3)
+            _, _nn = gaussians.knn_soft(_xyz[None], _xyz[_idx][None])      # (1, S, 4)
+            _nn = _nn[0]                                                   # (S, 4)
+            rot_loss = (_q_dr.unsqueeze(1) - _dr[_nn]).norm(dim=-1).mean()
+            loss = loss + opt.lambda_rot * rot_loss
         loss.backward()
         
         # end time

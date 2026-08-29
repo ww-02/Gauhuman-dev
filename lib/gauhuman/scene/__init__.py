@@ -81,7 +81,13 @@ class Scene:
                 ckpt = torch.load(model_path, map_location='cuda:0')
                 self.gaussians.pose_decoder.load_state_dict(ckpt['pose_decoder'])
                 self.gaussians.lweight_offset_decoder.load_state_dict(ckpt['lweight_offset_decoder'])
-    
+                if 'joint_psd' in ckpt:
+                    self.gaussians.joint_psd.load_state_dict(ckpt['joint_psd'])
+                if ckpt.get('dyn_skin', None) is not None:
+                    from nets.dyn_skin import DynamicSkinWeights
+                    self.gaussians.dyn_skin_net = DynamicSkinWeights(num_joints=24, pos_pe_L=4, hidden_dim=128, n_layers=3).to(self.gaussians.device)
+                    self.gaussians.dyn_skin_net.load_state_dict(ckpt['dyn_skin'])
+
     def prepare_big_pose_params(self):
 
         big_pose_params = {}
@@ -108,4 +114,6 @@ class Scene:
                 'iter': iteration,
                 'pose_decoder': self.gaussians.pose_decoder.state_dict(),
                 'lweight_offset_decoder': self.gaussians.lweight_offset_decoder.state_dict(),
+                'joint_psd': self.gaussians.joint_psd.state_dict(),
+                'dyn_skin': self.gaussians.dyn_skin_net.state_dict() if getattr(self.gaussians, 'dyn_skin_net', None) is not None else None,
             }, model_path)

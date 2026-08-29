@@ -25,6 +25,14 @@ import pickle
 import torch.nn.functional as F
 from nets.mlp_delta_body_pose import BodyPoseRefiner
 from nets.mlp_delta_weight_lbs import LBSOffsetDecoder
+from nets.dyn_skin import DynamicSkinWeights
+from nets.joint_psd import (
+    PoseSpaceDeformationModule,
+    apply_rotation_correction,
+    gaussian_normal,
+    IMPORTANT_JOINTS_SMPL,
+    SUGGESTED_RADII,
+)
 
 class GaussianModel:
 
@@ -49,7 +57,7 @@ class GaussianModel:
         self.rotation_activation = torch.nn.functional.normalize
 
 
-    def __init__(self, sh_degree : int, smpl_type : str, motion_offset_flag : bool, actor_gender: str):
+    def __init__(self, sh_degree : int, smpl_type : str, motion_offset_flag : bool, actor_gender: str, psd_pe_L : int = 4, psd_n_layers : int = 2):
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree  
         self._xyz = torch.empty(0)
@@ -76,6 +84,14 @@ class GaussianModel:
         # load knn module
         self.knn = KNN(k=1, transpose_mode=True)
         self.knn_near_2 = KNN(k=2, transpose_mode=True)
+        # k=4 soft skinning blend for continuous LBS weights across joint boundaries
+        self.knn_soft = KNN(k=4, transpose_mode=True)
+        self.dyn_skin_net = None
+        # RBF bandwidth for the soft blend (meters). ~1x SMPL edge length
+        # so that a Gaussian sitting exactly at the joint boundary receives a
+        # meaningful contribution from all 4 neighbors.
+        self.skinning_sigma = 0.02
+        self.use_knn_soft = True  # k=4 soft skinning blend (False -> k=1 hard nearest)
 
         self.motion_offset_flag = motion_offset_flag
         if self.motion_offset_flag:
@@ -87,6 +103,18 @@ class GaussianModel:
             # load lbs weight module
             self.lweight_offset_decoder = LBSOffsetDecoder(total_bones=total_bones)
             self.lweight_offset_decoder.to(self.device)
+
+            # per-joint pose-space correction (local PSD for LBS artifacts)
+            parents = self.SMPL_NEUTRAL['kintree_table'][0].cpu().tolist()
+            self.joint_psd = PoseSpaceDeformationModule(
+                joint_indices=IMPORTANT_JOINTS_SMPL,
+                parents=parents,
+                hidden_dim=64,
+                n_layers=psd_n_layers,
+                pe_L=psd_pe_L,
+                radii=SUGGESTED_RADII,
+            )
+            self.joint_psd.to(self.device)
 
     def capture(self):
         return (
@@ -102,21 +130,27 @@ class GaussianModel:
             self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
+            self.pose_decoder,
+            self.lweight_offset_decoder,
+            self.joint_psd,
         )
-    
+
     def restore(self, model_args, training_args):
-        (self.active_sh_degree, 
-        self._xyz, 
-        self._features_dc, 
+        (self.active_sh_degree,
+        self._xyz,
+        self._features_dc,
         self._features_rest,
-        self._scaling, 
-        self._rotation, 
+        self._scaling,
+        self._rotation,
         self._opacity,
-        self.max_radii2D, 
-        xyz_gradient_accum, 
+        self.max_radii2D,
+        xyz_gradient_accum,
         denom,
-        opt_dict, 
-        self.spatial_lr_scale) = model_args
+        opt_dict,
+        self.spatial_lr_scale,
+        self.pose_decoder,
+        self.lweight_offset_decoder,
+        self.joint_psd) = model_args
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
@@ -146,6 +180,15 @@ class GaussianModel:
     
     def get_covariance(self, scaling_modifier = 1, transform=None):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation, transform)
+
+    def get_covariance_corrected(self, scaling_modifier = 1, transform=None, d_scale=None, d_rot=None):
+        scaling = self.get_scaling
+        rotation = self._rotation
+        if d_scale is not None:
+            scaling = self.scaling_activation(self._scaling + d_scale)
+        if d_rot is not None:
+            rotation = apply_rotation_correction(rotation, d_rot)
+        return self.covariance_activation(scaling, scaling_modifier, rotation, transform)
 
     def oneupSHdegree(self):
         if self.active_sh_degree < self.max_sh_degree:
@@ -178,6 +221,7 @@ class GaussianModel:
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
+        self.delayed_activation = training_args.delayed_activation
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
@@ -200,7 +244,8 @@ class GaussianModel:
                 {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
                 {'params': self.pose_decoder.parameters(), 'lr': training_args.pose_refine_lr, "name": "pose_decoder"},
                 {'params': self.lweight_offset_decoder.parameters(), 'lr': training_args.lbs_offset_lr, "name": "lweight_offset_decoder"},
-            ] 
+                {'params': self.joint_psd.parameters(), 'lr': training_args.joint_psd_lr, "name": "joint_psd"},
+            ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -510,7 +555,8 @@ class GaussianModel:
         new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
-        new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
+        new_opacity = (inverse_sigmoid(torch.clamp(self.get_opacity[selected_pts_mask].repeat(N,1) * 0.2, 1e-6, 1-1e-6))
+                                if self.delayed_activation else self._opacity[selected_pts_mask].repeat(N,1))
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
 
@@ -629,12 +675,34 @@ class GaussianModel:
         # Find nearest smpl vertex
         smpl_pts = t_vertices
 
-        _, vert_ids = self.knn(smpl_pts.float(), query_pts.float())
-        if lbs_weights is None:
-            bweights = self.SMPL_NEUTRAL['weights'][vert_ids].view(*vert_ids.shape[:2], joints_num)#.cuda() # [bs, points_num, joints_num]
+        # Soft skinning blend: pull k=4 nearest SMPL vertices and RBF-weight them
+        # so LBS weights are continuous across joint boundaries.
+        if getattr(self, 'use_knn_soft', True):
+            dists4, vert_ids4 = self.knn_soft(smpl_pts.float(), query_pts.float())
+            # dists4, vert_ids4: (bs, N, 4). RBF weights over distance^2.
+            sigma = float(getattr(self, 'skinning_sigma', 0.02))
+            blend = F.softmax(-(dists4 ** 2) / (2.0 * sigma * sigma + 1e-8), dim=-1)  # (bs, N, 4)
+            # gather SMPL weights per neighbor: (bs, N, 4, J)
+            w_neighbors = self.SMPL_NEUTRAL['weights'][vert_ids4].view(*vert_ids4.shape[:2], 4, joints_num)
+            bweights_soft = (blend.unsqueeze(-1) * w_neighbors).sum(dim=-2)  # (bs, N, J)
         else:
-            bweights = self.SMPL_NEUTRAL['weights'][vert_ids].view(*vert_ids.shape[:2], joints_num)
-            bweights = torch.log(bweights + 1e-9) + lbs_weights
+            # k=1 hard nearest SMPL vertex (original GauHuman skinning)
+            _, vert_ids = self.knn(smpl_pts.float(), query_pts.float())
+            bweights_soft = self.SMPL_NEUTRAL['weights'][vert_ids].view(bs, -1, joints_num)
+        # ---- Dynamic Skin Weights (RnD-Avatar-inspired, single-frame) ----
+        if getattr(self, "dyn_skin_net", None) is not None:
+            with torch.enable_grad():
+                theta_t = params["poses"].reshape(bs, -1).to(query_pts.device).float()
+                delta_w = self.dyn_skin_net(query_pts, theta_t)  # (bs, N, J)
+            bweights_soft = F.softmax(torch.log(bweights_soft + 1e-9) + delta_w, dim=-1)
+
+        # keep hard KNN id available for other code paths that expect vert_ids (k=1)
+        _, vert_ids = self.knn(smpl_pts.float(), query_pts.float())
+
+        if lbs_weights is None:
+            bweights = bweights_soft
+        else:
+            bweights = torch.log(bweights_soft + 1e-9) + lbs_weights
             bweights = F.softmax(bweights, dim=-1)
 
         ### From Big To T Pose
@@ -723,6 +791,45 @@ class GaussianModel:
             translation = torch.matmul(translation, R_inv).squeeze(-1) + Th
 
         return smpl_src_pts, world_src_pts, bweights, transforms, translation
+
+    def pose_space_deform(self, query_pts, params, t_params, correct_Rs=None):
+        """Per-joint pose-space correction (d_xyz, d_scale, d_rot) in canonical space.
+
+        Args:
+            query_pts: (bs, N, 3) canonical Gaussian means.
+            params:    SMPL params of the current (source) pose.
+            t_params:  SMPL params of the rest (big-pose).
+            correct_Rs: (bs, J-1, 3, 3) bone-level rotation corrections from the
+                        BodyPoseRefiner (already applied to the target-pose transforms).
+
+        Returns:
+            d_xyz:   (bs, N, 3) canonical-space mean correction.
+            d_scale: (bs, N, 3) log-scale correction.
+            d_rot:   (bs, N, 3) axis-angle rotation correction.
+        """
+        bs = query_pts.shape[0]
+
+        # rest (big-pose / T-pose) joint transforms
+        A_rest, _, _, _ = get_transform_params_torch(self.SMPL_NEUTRAL, t_params)
+
+        # target-pose joint transforms (with the bone-level correct_Rs, matching
+        # how coarse_deform_c2source builds them)
+        rot_mats = batch_rodrigues(params['poses'].view(-1, 3)).view(bs, -1, 3, 3)
+        if correct_Rs is not None:
+            rot_mats_no_root = rot_mats[:, 1:]
+            rot_mats_no_root = torch.matmul(
+                rot_mats_no_root.reshape(-1, 3, 3),
+                correct_Rs.reshape(-1, 3, 3),
+            ).reshape(-1, rot_mats.shape[1] - 1, 3, 3)
+            rot_mats = torch.cat([rot_mats[:, 0:1], rot_mats_no_root], dim=1)
+        A_pose, _, _, _ = get_transform_params_torch(self.SMPL_NEUTRAL, params, rot_mats=rot_mats)
+
+        log_scales = self._scaling.detach()[None].expand(bs, -1, -1)
+        normals = gaussian_normal(self._rotation.detach(), self._scaling.detach())[None].expand(bs, -1, -1)
+
+        # detach the inputs: the correction should be a function of the pose,
+        # not drive the canonical Gaussian params through a second gradient path
+        return self.joint_psd(query_pts.detach(), normals, log_scales, A_rest, A_pose)
 
 def read_pickle(pkl_path):
     with open(pkl_path, 'rb') as f:

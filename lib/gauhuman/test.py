@@ -21,9 +21,20 @@ def test_single(tb_writer, scene : Scene, renderFunc, renderArgs, visualing=True
     psnr_sub_view = []
     ssim_sub_view = []
     lpips_sub_view = []
+
+    render_time = 0.0
+    render_count = 0
+
     for pose_id, viewpoint in tqdm(enumerate(test_loader), desc="Views of {}".format(human_name), total=len(viewpointset)):
         viewpoint = data_to_device(viewpoint)
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
         render_output = renderFunc(viewpoint, scene.gaussians, *renderArgs, return_smpl_rot=True)
+        end_event.record()
+        torch.cuda.synchronize()
+        render_time += start_event.elapsed_time(end_event) / 1000.0   # 转为秒
+        render_count += 1
         image = torch.clamp(render_output["render"], 0.0, 1.0)
         gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
 
@@ -45,7 +56,8 @@ def test_single(tb_writer, scene : Scene, renderFunc, renderArgs, visualing=True
             filename = os.path.join(savedir_human, '{:02d}_psnr{:04d}.png'.format(pose_id, int(psnr_*100)))
             img = rgb8
             imageio.imwrite(filename, img.astype(np.uint8))
-            
+
+   
     avg_psnr = np.array(psnr_sub_view).mean()
     np.save(savedir_human+'/psnr_{}.npy'.format(int(avg_psnr*100)), np.array(avg_psnr))
     avg_ssim = np.array(ssim_sub_view).mean()
@@ -53,3 +65,5 @@ def test_single(tb_writer, scene : Scene, renderFunc, renderArgs, visualing=True
     avg_lpips = np.array(lpips_sub_view).mean()
     np.save(savedir_human+'/lpips_{}.npy'.format(int(avg_lpips*100)), np.array(avg_lpips))
     torch.cuda.empty_cache()
+    fps = render_count / render_time if render_time > 0 else 0.0
+    print(f"Test - PSNR: {avg_psnr:.2f} dB, SSIM: {avg_ssim:.4f}, LPIPS: {avg_lpips:.4f},FPS: {fps:.2f}")
